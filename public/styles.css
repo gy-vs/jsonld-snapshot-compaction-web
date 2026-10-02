@@ -121,6 +121,7 @@ select:focus, input:focus, textarea:focus { outline: 2px solid rgba(77,163,255,.
 
 /* ---------- trees ---------- */
 .tree-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; min-width: 0; }
+.tree-grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .tree-card { min-width: 0; display: flex; flex-direction: column; }
 .tree-hint { font-size: 11px; color: var(--text-dim); }
 .tree {
@@ -226,6 +227,44 @@ select:focus, input:focus, textarea:focus { outline: 2px solid rgba(77,163,255,.
 
 .hidden { display: none !important; }
 
+/* ---------- compaction ---------- */
+.compact-status {
+  border-radius: 6px; padding: 8px 10px; margin-top: 9px; font-size: 12px;
+  line-height: 1.7;
+}
+.compact-status.ok { border: 1px solid rgba(83,194,135,.4); background: rgba(83,194,135,.1); color: #9fe0bb; }
+.compact-status.err { border: 1px solid rgba(224,108,108,.5); background: rgba(224,108,108,.1); color: #f0b4b4; white-space: pre-wrap; }
+.compact-details {
+  background: #0b1118; border-radius: 6px; padding: 8px; margin: 6px 0 0;
+  font-family: var(--mono); font-size: 11.5px; color: #e8c98f; overflow: auto;
+}
+.compact-fail { color: var(--danger); }
+.compact-head { background: rgba(77,163,255,.1); border-color: rgba(77,163,255,.4); }
+
+.cand-list { display: flex; flex-direction: column; gap: 5px; }
+.cand {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  border: 1px solid var(--border); border-radius: 6px; padding: 5px 9px;
+  background: #0d131b; font-size: 12px;
+}
+.cand.accepted { border-color: rgba(83,194,135,.55); background: rgba(83,194,135,.08); }
+.cand.rejected { opacity: .82; }
+.cand-key { font-family: var(--mono); color: #83b5e8; word-break: break-all; }
+.cand-via { color: var(--text-dim); font-size: 11px; }
+.cand-mark { font-size: 11px; white-space: nowrap; }
+.cand-mark.ok { color: var(--green); }
+.cand-mark.no { color: var(--danger); flex-basis: 100%; }
+.vdec-list { display: flex; flex-direction: column; gap: 4px; }
+.vdec { font-size: 11.5px; color: var(--text-dim); background: #0d131b; border: 1px solid var(--border); border-radius: 6px; padding: 4px 9px; }
+.vdec.unsafe { border-color: rgba(224,163,78,.45); color: #e8c98f; }
+
+/* Three trees need a wide screen; at medium widths they stack within the
+   trees panel rather than crushing each column. */
+@media (min-width: 1081px) and (max-width: 1440px) {
+  .tree-grid.three { grid-template-columns: 1fr; }
+  .tree-grid.three .tree { max-height: 46vh; }
+}
+
 /* ---------- responsive: narrow screens go tab-by-tab ---------- */
 @media (max-width: 1080px) {
   .layout { grid-template-columns: 1fr; }
@@ -235,7 +274,7 @@ select:focus, input:focus, textarea:focus { outline: 2px solid rgba(77,163,255,.
   body.show-trees .panel-trees,
   body.show-trace .panel-trace,
   body.show-resources .panel-resources { display: flex; }
-  .tree-grid { grid-template-columns: 1fr; }
+  .tree-grid, .tree-grid.three { grid-template-columns: 1fr; }
   .tree { max-height: 56vh; }
   .sticky { position: static; }
   .topbar { flex-direction: column; align-items: stretch; }

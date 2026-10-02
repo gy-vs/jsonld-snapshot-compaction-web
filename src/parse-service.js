@@ -24,6 +24,11 @@ export function runParse({ document, snapshotMap, baseUrl = null, sessionId = nu
     traces: result.traces,
     warnings: result.warnings,
     decisionChain: decorateChain(result.decisionChain, snapshotMap),
+    scopes: result.scopes.map(scope => ({
+      ...scope,
+      chain: decorateChain(scope.chain ?? [], snapshotMap)
+    })),
+    rootContext: result.rootContext,
     finalContext: result.finalContext,
     pinnedResources: pinned
   };

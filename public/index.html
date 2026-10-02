@@ -22,8 +22,8 @@
 
   <nav class="tabs" id="tabs">
     <button class="tab active" data-tab="input">文档 / 资源</button>
-    <button class="tab" data-tab="trees">原文 ↔ 展开</button>
-    <button class="tab" data-tab="trace">决策链</button>
+    <button class="tab" data-tab="trees">原文 ↔ 展开 ↔ 紧凑</button>
+    <button class="tab" data-tab="trace">决策链 / 压缩选择</button>
     <button class="tab" data-tab="resources">资源库</button>
   </nav>
 
@@ -45,7 +45,9 @@
             <input id="baseUrlInput" type="text" placeholder="（可选）https://example.com/things/" />
           </label>
           <button id="parseBtn" class="btn primary">展开 (Expand)</button>
+          <button id="compactBtn" class="btn primary" disabled>压缩 (Compact)</button>
         </div>
+        <div id="compactStatus" class="compact-status hidden"></div>
         <div id="docError" class="error-banner hidden"></div>
       </div>
 
@@ -64,9 +66,9 @@
       </div>
     </section>
 
-    <!-- ============ 中：双树对照 ============ -->
+    <!-- ============ 中：三树对照 ============ -->
     <section class="panel panel-trees" data-panel="trees">
-      <div class="tree-grid">
+      <div class="tree-grid three">
         <div class="card tree-card">
           <div class="card-head"><h2>原始文档</h2><span class="tree-hint">高亮 = 被选中字段的来源</span></div>
           <div id="sourceTree" class="tree"></div>
@@ -78,16 +80,23 @@
           </div>
           <div id="expandedTree" class="tree"></div>
         </div>
+        <div class="card tree-card">
+          <div class="card-head">
+            <h2>紧凑结果</h2>
+            <span id="compactBadge" class="tree-hint"></span>
+          </div>
+          <div id="compactTree" class="tree"></div>
+        </div>
       </div>
       <div id="warnings" class="warnings"></div>
     </section>
 
-    <!-- ============ 右：追踪 / 决策链 ============ -->
+    <!-- ============ 右：追踪 / 决策链 / 压缩选择 ============ -->
     <section class="panel panel-trace" data-panel="trace">
       <div class="card sticky">
-        <div class="card-head"><h2>③ 字段来源追踪</h2></div>
+        <div class="card-head"><h2>③ 字段来源追踪 / 压缩选择</h2></div>
         <div id="traceDetail" class="trace-detail">
-          <p class="placeholder">在「展开结果」中点击任意字段。<br/>将显示：原始字段路径、展开 IRI、词项解析方式与完整 context 决策链。</p>
+          <p class="placeholder">在「展开结果」或「紧凑结果」中点击任意字段。<br/>展开字段显示：原始路径、展开 IRI、词项解析与完整 context 决策链。<br/>紧凑字段额外显示：用了哪个资源 revision、为何采用此可读名称、以及未采用其他候选的原因。</p>
         </div>
       </div>
       <div class="card sticky">

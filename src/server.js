@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize, extname } from 'node:path';
 import { Store } from './store.js';
 import { runParse } from './parse-service.js';
+import { runCompact } from './compact-service.js';
 import { JsonLdError } from './jsonld/errors.js';
 import { seedIfEmpty } from './seed.js';
 
@@ -95,6 +96,30 @@ async function route(req, res, store) {
       return sendJson(res, 200, { sessionId: id, ...output });
     }
   }
+  if (path.startsWith('/api/sessions/') && path.endsWith('/compact')) {
+    const id = decodeURIComponent(path.split('/')[3]);
+    if (method === 'POST') {
+      const session = store.data.sessions[id];
+      if (!session) throw new JsonLdError('not found', `Session "${id}" does not exist`);
+      const input = await readJson(req);
+      if (!input || !Array.isArray(input.expanded)) {
+        throw new JsonLdError('validation error',
+          'POST /api/sessions/:id/compact expects { expanded, rootContext?, scopes?, baseUrl? }');
+      }
+      // Compaction is interpreted against the revisions the session pinned at
+      // creation time — resource head is never consulted.
+      const snapshotMap = store.snapshotFor(session);
+      const output = runCompact({
+        expanded: input.expanded,
+        snapshotMap,
+        rootContext: input.rootContext ?? null,
+        scopes: input.scopes ?? null,
+        baseUrl: input.baseUrl ?? null,
+        sessionId: id
+      });
+      return sendJson(res, 200, { sessionId: id, ...output });
+    }
+  }
   if (path.startsWith('/api/sessions/')) {
     const id = decodeURIComponent(path.slice('/api/sessions/'.length));
     if (method === 'GET') return sendJson(res, 200, store.getSession(id));
@@ -113,6 +138,24 @@ async function route(req, res, store) {
       baseUrl: input.baseUrl ?? null,
       maxDepth: input.maxDepth ?? 64,
       maxContextDepth: input.maxContextDepth ?? 32
+    });
+    return sendJson(res, 200, { ...output, pinnedResources: pinned });
+  }
+
+  // ad-hoc compact: compact someone else's expanded output against a locally
+  // pinned target context (resource bindings, never fetched over the network)
+  if (path === '/api/compact' && method === 'POST') {
+    const input = await readJson(req);
+    if (!input || !Array.isArray(input.expanded)) {
+      throw new JsonLdError('validation error',
+        'POST /api/compact expects { expanded, bindings, rootContext?, scopes?, baseUrl? }');
+    }
+    const { map, pinned } = store.resolveAdHocSnapshot(input.bindings ?? {});
+    const output = runCompact({
+      expanded: input.expanded, snapshotMap: map,
+      rootContext: input.rootContext ?? null,
+      scopes: input.scopes ?? null,
+      baseUrl: input.baseUrl ?? null
     });
     return sendJson(res, 200, { ...output, pinnedResources: pinned });
   }
@@ -162,6 +205,7 @@ function sendError(res, err) {
     'cyclic IRI mapping': 422,
     'context overflow': 422,
     'processing depth exceeded': 422,
+    'unrepresentable compaction': 422,
     'protected term redefinition': 409,
     'revision conflict': 409,
     'unknown resource': 404,

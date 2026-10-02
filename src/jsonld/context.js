@@ -93,7 +93,12 @@ export function processContext(active, localContext, opts) {
     depth = 0,
     maxDepth = 32,
     baseUrl = null,
-    propagate = true
+    propagate = true,
+    // Stack of origins currently being processed: null = inline context object,
+    // otherwise the "local:<name>" ref being expanded. The innermost non-null
+    // entry identifies which immutable resource revision defined a term, so
+    // decisions can be attributed to a revision (provenance for compaction).
+    sourceStack = []
   } = opts;
 
   if (depth > maxDepth) {
@@ -154,7 +159,7 @@ export function processContext(active, localContext, opts) {
       nextRemote.add(ref);
       result = processContext(result, resolved, {
         loader, chain, remoteContexts: nextRemote, depth: depth + 1, maxDepth,
-        baseUrl, propagate
+        baseUrl, propagate, sourceStack: [...sourceStack, ref]
       });
       continue;
     }
@@ -165,14 +170,18 @@ export function processContext(active, localContext, opts) {
     }
 
     // 5.7 context object
-    result = applyContextObject(result, item, { loader, chain, remoteContexts, depth, maxDepth, baseUrl, propagate });
+    result = applyContextObject(result, item, { loader, chain, remoteContexts, depth, maxDepth, baseUrl, propagate, sourceStack });
   }
 
   return result;
 }
 
 function applyContextObject(result, ctxObj, opts) {
-  const { loader, chain, remoteContexts, depth, maxDepth, baseUrl } = opts;
+  const { loader, chain, remoteContexts, depth, maxDepth, baseUrl, sourceStack } = opts;
+  // The resource revision responsible for terms this object defines: the
+  // innermost entry that came from a "local:" include (inline nested contexts
+  // inherit the origin of the file that embeds them).
+  const sourceRef = [...sourceStack].reverse().find(ref => ref !== null) ?? null;
 
   // Nested include: a context object may itself carry an "@context" entry
   // referencing/embedding another context (file-to-file nesting). Process it
@@ -181,7 +190,8 @@ function applyContextObject(result, ctxObj, opts) {
     const nested = ctxObj['@context'];
     result = processContext(result, nested, {
       loader, chain, remoteContexts: new Set(remoteContexts),
-      depth: depth + 1, maxDepth, baseUrl, propagate: opts.propagate
+      depth: depth + 1, maxDepth, baseUrl, propagate: opts.propagate,
+      sourceStack: opts.sourceStack
     });
   }
 
@@ -251,7 +261,7 @@ function applyContextObject(result, ctxObj, opts) {
   const defined = new Map(); // term -> boolean (true = fully defined)
   for (const key of Object.keys(ctxObj)) {
     if (key.startsWith('@')) continue; // keyword entries handled above
-    createTermDefinition(result, ctxObj, key, defined, chain, { loader, remoteContexts, depth, maxDepth, baseUrl });
+    createTermDefinition(result, ctxObj, key, defined, chain, { loader, remoteContexts, depth, maxDepth, baseUrl }, sourceRef);
   }
   rebuildAliases(result);
   return result;
@@ -261,7 +271,7 @@ function applyContextObject(result, ctxObj, opts) {
 // Term definitions (JSON-LD 1.1 §5.3 create term definition)
 // ---------------------------------------------------------------------------
 
-function createTermDefinition(result, ctxObj, term, defined, chain, env) {
+function createTermDefinition(result, ctxObj, term, defined, chain, env, sourceRef = null) {
   if (defined.has(term)) {
     if (defined.get(term)) return;
     throw new JsonLdError(ERR.CYCLIC_IRI_MAPPING, `Cyclic term definition involving "${term}"`, { term });
@@ -284,7 +294,7 @@ function createTermDefinition(result, ctxObj, term, defined, chain, env) {
         `Protected term "${term}" cannot be removed (set to null)`, { term });
     }
     result.terms.delete(term);
-    chain.push({ kind: 'term-cleared', term, note: 'term mapping removed' });
+    chain.push({ kind: 'term-cleared', term, sourceRef, note: 'term mapping removed' });
     defined.set(term, true);
     return;
   }
@@ -329,7 +339,7 @@ function createTermDefinition(result, ctxObj, term, defined, chain, env) {
       throw new JsonLdError(ERR.INVALID_IRI_MAPPING, `@id of "${term}" must be a string or null`);
     } else if (isKeyword(raw)) {
       id = raw;
-      chain.push({ kind: 'keyword-alias', term, keyword: raw, note: `"${term}" is now an alias of ${raw}` });
+      chain.push({ kind: 'keyword-alias', term, keyword: raw, sourceRef, note: `"${term}" is now an alias of ${raw}` });
     } else if (looksLikeKeyword(raw)) {
       throw new JsonLdError(ERR.KEYWORD_REDEFINITION ?? ERR.INVALID_IRI_MAPPING,
         `"${raw}" looks like a keyword but is not defined in JSON-LD 1.1`, { term, id: raw });
@@ -389,8 +399,12 @@ function createTermDefinition(result, ctxObj, term, defined, chain, env) {
   }
 
   // --- @language ---
+  // languageSet distinguishes "@language": null (explicitly no language,
+  // which suppresses the active default) from an absent @language (inherit
+  // the active default language) — both otherwise look like null here.
   let language = null;
-  if ('@language' in def) {
+  let languageSet = '@language' in def;
+  if (languageSet) {
     if (def['@language'] !== null && typeof def['@language'] !== 'string') {
       throw new JsonLdError(ERR.INVALID_LANGUAGE_MAPPING, `Invalid @language for term "${term}"`);
     }
@@ -409,6 +423,7 @@ function createTermDefinition(result, ctxObj, term, defined, chain, env) {
     container,
     typeMapping,
     language,
+    languageSet,
     prefix,
     protected: isProtected,
     reverse: false,
@@ -422,6 +437,7 @@ function createTermDefinition(result, ctxObj, term, defined, chain, env) {
     kind: previousDef ? 'term-override' : 'term',
     term,
     id,
+    sourceRef,
     container: container ?? undefined,
     typeMapping: typeMapping ?? undefined,
     language: language ?? undefined,
@@ -483,7 +499,7 @@ export function expandIri(ctx, value, options = {}) {
     }
     // defining a prefix on the fly (rare in this workbench) — resolve via definitions
     if (ctxObj && defined && ctxObj[prefix] !== undefined && !ctx.terms.has(prefix)) {
-      createTermDefinition(ctx, ctxObj, prefix, defined, chain ?? [], env ?? {});
+      createTermDefinition(ctx, ctxObj, prefix, defined, chain ?? [], env ?? {}, env?.sourceRef ?? null);
     }
     const def = ctx.terms.get(prefix);
     if (def && typeof def.id === 'string') {

@@ -197,3 +197,187 @@ describe('session API', () => {
     assert.equal(res.status, 404);
   });
 });
+
+describe('compact API: full save → session → parse → compact → re-expand → modify path', () => {
+  test('end-to-end: compaction re-expands identically, then a resource edit does not change the session view', async () => {
+    // 1. save a resource (revision 1)
+    const created = await api('PUT', '/api/resources/vocab', {
+      body: {
+        '@base': 'https://example.com/things/',
+        '@vocab': 'https://schema.org/',
+        'id': '@id', 'kind': '@type',
+        'created': { '@id': 'dateCreated', '@type': 'xsd:date' },
+        'xsd': { '@id': 'http://www.w3.org/2001/XMLSchema#', '@prefix': true }
+      },
+      baseRevision: null
+    });
+    assert.equal(created.status, 200);
+    const rev1 = created.json.revision;
+
+    // 2. create a session pinned to rev1
+    const ses = await api('POST', '/api/sessions', {
+      name: 'compact-e2e', bindings: { vocab: rev1 }
+    });
+    assert.equal(ses.status, 201);
+    const sid = ses.json.id;
+
+    // 3. parse a compact document
+    const parsed = await api('POST', `/api/sessions/${sid}/parse`, {
+      document: {
+        '@context': 'local:vocab',
+        'id': 'widget/9', 'kind': 'Product', 'created': '2026-09-26'
+      }
+    });
+    assert.equal(parsed.status, 200);
+
+    // 4. compact the EXPANDED result against the pinned snapshot
+    const compact = await api('POST', `/api/sessions/${sid}/compact`, {
+      expanded: parsed.json.expanded,
+      rootContext: parsed.json.rootContext,
+      scopes: parsed.json.scopes
+    });
+    assert.equal(compact.status, 200);
+    assert.equal(compact.json.verified, true);
+    assert.equal(compact.json.pinnedResources.vocab, rev1);
+    assert.equal(compact.json.compacted.id, 'widget/9');
+    assert.equal(compact.json.compacted.kind, 'Product');
+    assert.equal(compact.json.compacted.created, '2026-09-26');
+
+    // 5. feed the compact document back into the expander — must match the
+    //    original expansion semantically
+    const reparsed = await api('POST', `/api/sessions/${sid}/parse`, {
+      document: compact.json.compacted
+    });
+    assert.equal(reparsed.status, 200);
+    assert.deepEqual(
+      normalize(reparsed.json.expanded),
+      normalize(parsed.json.expanded)
+    );
+
+    // 6. a second page edits the resource (new vocab/IRI layout) on rev2
+    const updated = await api('PUT', '/api/resources/vocab', {
+      body: {
+        '@vocab': 'https://schema.org/v2/',
+        'id': '@id', 'kind': '@type',
+        'created': { '@id': 'dateCreated' }
+      },
+      baseRevision: rev1
+    });
+    assert.equal(updated.status, 200);
+    const rev2 = updated.json.revision;
+    assert.notEqual(rev1, rev2);
+
+    // 7. re-compacting the SAME expanded data in session A must still be
+    //    interpreted by rev1, never by head
+    const again = await api('POST', `/api/sessions/${sid}/compact`, {
+      expanded: parsed.json.expanded,
+      rootContext: parsed.json.rootContext,
+      scopes: parsed.json.scopes
+    });
+    assert.equal(again.status, 200);
+    assert.equal(again.json.pinnedResources.vocab, rev1);
+    assert.deepEqual(normalize(again.json.compacted), normalize(compact.json.compacted));
+
+    // 8. a brand-new session (or ad-hoc parse) DOES read the new head
+    const adhoc = await api('POST', '/api/parse', {
+      document: { '@context': 'local:vocab', 'created': 'x' },
+      bindings: { vocab: 'latest' }
+    });
+    assert.ok(adhoc.json.expanded[0]['https://schema.org/v2/dateCreated']);
+  });
+
+  test('compaction keeps a node-local @context on exactly its node', async () => {
+    await api('PUT', '/api/resources/rootctx', { body: { '@vocab': 'https://root/' }, baseRevision: null });
+    const cur = await api('GET', '/api/resources/rootctx');
+    await api('PUT', '/api/resources/rootctx', {
+      body: { '@vocab': 'https://root/' }, baseRevision: cur.json.latestRevision
+    }).catch(() => {});
+    await api('PUT', '/api/resources/subctx', {
+      body: { '@vocab': 'https://sub/', 'label': '@id' }, baseRevision: null
+    });
+
+    const parsed = await api('POST', '/api/parse', {
+      document: {
+        '@context': 'local:rootctx',
+        'a': { '@context': 'local:subctx', 'label': 'x' },
+        'b': { 'onlyInRoot': 1 }
+      },
+      bindings: { rootctx: 'latest', subctx: 'latest' }
+    });
+    assert.equal(parsed.status, 200);
+    assert.equal(parsed.json.scopes.length, 1);
+
+    const compact = await api('POST', '/api/compact', {
+      expanded: parsed.json.expanded,
+      rootContext: parsed.json.rootContext,
+      scopes: parsed.json.scopes,
+      bindings: { rootctx: 'latest', subctx: 'latest' }
+    });
+    assert.equal(compact.status, 200);
+    assert.equal(compact.json.compacted.a['@context'], 'local:subctx');
+    assert.ok(!('@context' in compact.json.compacted.b));
+
+    // scope provenance attributes the include to the pinned revision
+    const scope = compact.json.scopeLayout[0];
+    assert.equal(scope.raw, 'local:subctx');
+    assert.ok(scope.includes[0].revision);
+
+    const reparsed = await api('POST', '/api/parse', {
+      document: compact.json.compacted,
+      bindings: { rootctx: 'latest', subctx: 'latest' }
+    });
+    assert.deepEqual(normalize(reparsed.json.expanded), normalize(parsed.json.expanded));
+  });
+
+  test('ad-hoc compact with no provenance binds all given resources', async () => {
+    const res = await api('POST', '/api/compact', {
+      expanded: [{ '@id': 'https://schema.org/z', 'https://schema.org/name': [{ '@value': 'N' }] }],
+      bindings: { schema: 'latest' }
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.verified, true);
+    assert.equal(res.json.pinnedResources.schema, res.json.pinnedResources.schema);
+    assert.ok(res.json.compacted['@context']);
+  });
+
+  test('compaction against an unknown bound resource reports unknown resource, trees stay on client', async () => {
+    const res = await api('POST', '/api/compact', {
+      expanded: [{ 'https://v/x': [{ '@value': 1 }] }],
+      bindings: { ghost: 'latest' }
+    });
+    assert.equal(res.status, 404);
+    assert.equal(res.json.error.code, 'unknown resource');
+  });
+
+  test('compaction requires an expanded array', async () => {
+    const res = await api('POST', '/api/compact', { compacted: {}, bindings: {} });
+    assert.equal(res.status, 400);
+    assert.equal(res.json.error.code, 'validation error');
+  });
+
+  test('remote context is still refused during re-expansion verification', async () => {
+    const res = await api('POST', '/api/compact', {
+      // expanded data that would need a term, but bind nothing and ask for a
+      // remote root context — verification must never touch the network
+      expanded: [{ 'https://v/x': [{ '@value': 1 }] }],
+      bindings: {},
+      rootContext: 'https://schema.org/'
+    });
+    assert.equal(res.status, 400);
+    assert.equal(res.json.error.code, 'loading remote context failed');
+  });
+});
+
+// Semantic normalization shared with the compaction round-trip checks.
+function normalize(v) {
+  if (Array.isArray(v)) return v.map(normalize);
+  if (v && typeof v === 'object') {
+    const o = {};
+    for (const k of Object.keys(v).sort()) o[k] = normalize(v[k]);
+    if ('@value' in o && Array.isArray(o['@type']) && o['@type'].length === 1) {
+      o['@type'] = o['@type'][0];
+    }
+    return o;
+  }
+  return v;
+}

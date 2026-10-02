@@ -7,10 +7,14 @@ const state = {
   sessionId: null,
   bindings: new Map(),   // name -> revision id (only checked entries)
   result: null,
+  compact: null,
+  compactError: null,
+  baseUrl: null,
   editor: { name: null, baseRevision: null, selectedRevision: null, mode: 'edit' },
   pendingBody: null,
   sourcePathEls: new Map(),
-  expandedPathEls: new Map()
+  expandedPathEls: new Map(),
+  compactPathEls: new Map()
 };
 
 // ---------------------------------------------------------------- API -----
@@ -230,6 +234,7 @@ async function loadSessions(selectId = null) {
 
 $('#sessionSelect').addEventListener('change', async e => {
   const id = e.target.value;
+  resetParseState();
   if (!id) {
     state.sessionId = null;
     $('#sessionInfo').textContent = '';
@@ -310,27 +315,83 @@ function readDoc(silent = false) {
 
 $('#parseBtn').addEventListener('click', doParse);
 
+// Changing the document, bindings or session invalidates any previous
+// expansion/compaction: keep the input text but clear derived views.
+function resetParseState() {
+  state.result = null;
+  state.compact = null;
+  state.compactError = null;
+  state.baseUrl = null;
+  $('#compactBtn').disabled = true;
+  $('#compactBtn').textContent = '压缩 (Compact)';
+  $('#compactStatus').classList.add('hidden');
+  renderResults(null);
+  renderCompact(null);
+}
+
 async function doParse() {
   const document = readDoc();
   if (document === undefined) return;
   const baseUrl = $('#baseUrlInput').value.trim() || null;
+  state.baseUrl = baseUrl;
   const bindings = Object.fromEntries(state.bindings);
   try {
     const result = state.sessionId
       ? await api('POST', `/api/sessions/${state.sessionId}/parse`, { document, baseUrl })
       : await api('POST', '/api/parse', { document, bindings, baseUrl });
     state.result = result;
+    state.compact = null;
+    state.compactError = null;
     renderResults(result);
+    renderCompact(null);
+    $('#compactBtn').disabled = false;
     switchTab('trees');
   } catch (err) {
     $('#docError').textContent = `${err.code}\n${err.message}` +
       (err.details ? `\n\n${JSON.stringify(err.details, null, 2)}` : '');
     $('#docError').classList.remove('hidden');
-    // still show partial diagnostic chain when available
-    state.result = null;
-    renderResults(null);
+    // Keep any previous input and expansion visible so the user can tell a
+    // bad resource reference / context conflict apart from an empty result.
     switchTab('input');
   }
+}
+
+$('#compactBtn').addEventListener('click', doCompact);
+
+async function doCompact() {
+  if (!state.result) return;
+  const bindings = Object.fromEntries(state.bindings);
+  const payload = {
+    expanded: state.result.expanded,
+    // Reuse the exact provenance of this parse: node @context scopes and the
+    // document context resolve against the SAME pinned revisions.
+    rootContext: state.result.rootContext ?? null,
+    scopes: state.result.scopes ?? [],
+    baseUrl: state.baseUrl
+  };
+  setCompactBusy(true);
+  try {
+    const result = state.sessionId
+      ? await api('POST', `/api/sessions/${state.sessionId}/compact`, payload)
+      : await api('POST', '/api/compact', { ...payload, bindings });
+    state.compact = result;
+    state.compactError = null;
+    renderCompact(result);
+  } catch (err) {
+    // An unrepresentable request / unknown resource / context conflict must
+    // not blank the trees: keep expansion and show the cause inline.
+    state.compact = null;
+    state.compactError = err;
+    renderCompact(null);
+  } finally {
+    setCompactBusy(false);
+  }
+}
+
+function setCompactBusy(busy) {
+  $('#compactBtn').disabled = busy || !state.result;
+  $('#compactBtn').textContent = busy ? '压缩中…' : '压缩 (Compact)';
+  if (busy) $('#compactStatus').classList.add('hidden');
 }
 
 // -------------------------------------------------------------- results ---
@@ -363,7 +424,42 @@ function renderResults(result) {
   $('#warnings').innerHTML = (result.warnings || [])
     .map(w => `<div class="warning">⚠ ${escapeHtml(w.message)}</div>`).join('');
   renderGlobalChain(result.decisionChain);
-  $('#traceDetail').innerHTML = '<p class="placeholder">在「展开结果」中点击任意字段。</p>';
+  $('#traceDetail').innerHTML = '<p class="placeholder">在「展开结果」或「紧凑结果」中点击任意字段。</p>';
+}
+
+// --------------------------------------------------------- compact result --
+function renderCompact(result) {
+  state.compactPathEls = new Map();
+  const root = $('#compactTree');
+  const badge = $('#compactBadge');
+  const status = $('#compactStatus');
+  root.innerHTML = '';
+  badge.textContent = '';
+  status.className = 'compact-status hidden';
+
+  if (state.compactError) {
+    const err = state.compactError;
+    root.innerHTML = `<p class="placeholder compact-fail">压缩未生成。展开结果保持不变。</p>`;
+    status.className = 'compact-status err';
+    status.innerHTML =
+      `<strong>${escapeHtml(err.code)}</strong><br/>${escapeHtml(err.message)}` +
+      (err.details ? `<pre class="compact-details">${escapeHtml(JSON.stringify(err.details, null, 2))}</pre>` : '');
+    return;
+  }
+  if (!result) {
+    root.innerHTML = '<p class="placeholder">尚未压缩。点击输入区的「压缩 (Compact)」，将依据当前绑定/会话快照生成紧凑文档。</p>';
+    return;
+  }
+  root.appendChild(buildTree(result.compacted, '$', 'compact'));
+  const pinned = Object.entries(result.pinnedResources || {});
+  badge.textContent = result.verified
+    ? `✓ 再展开一致 · ${pinned.length} 个钉死 revision`
+    : '⚠ 未通过再展开校验';
+  status.className = 'compact-status ok';
+  status.innerHTML =
+    `✓ 紧凑文档已生成并通过再展开校验（语义与展开结果一致）。` +
+    `依据 <strong>${pinned.length}</strong> 个不可变 revision：` +
+    pinned.map(([n, rev]) => `<code>local:${escapeHtml(n)}@${shortRev(rev)}</code>`).join(' ');
 }
 
 // -------------------------------------------------------------- tree UI ---
@@ -388,7 +484,8 @@ function renderNode(value, path, key, kind, isRoot = false) {
 
   if (!isRoot || Array.isArray(value)) {
     const keyEl = document.createElement('span');
-    keyEl.className = 'key' + (kind === 'expanded' ? keyClass(key) : (key.startsWith('@') ? ' keyword' : ''));
+    const compactLike = kind === 'expanded' || kind === 'compact';
+    keyEl.className = 'key' + (compactLike ? keyClass(key) : (key.startsWith('@') ? ' keyword' : ''));
     keyEl.textContent = isRoot ? '' : key;
     wrap.appendChild(keyEl);
   }
@@ -427,6 +524,13 @@ function renderNode(value, path, key, kind, isRoot = false) {
     state.sourcePathEls.set(path, wrap);
     wrap.classList.add('clickable');
     wrap.addEventListener('click', () => selectFromSource(path));
+  } else if (kind === 'compact') {
+    state.compactPathEls.set(path, wrap);
+    wrap.classList.add('clickable');
+    wrap.addEventListener('click', (e) => {
+      e.stopPropagation();
+      selectFromCompact(path);
+    });
   } else {
     state.expandedPathEls.set(path, wrap);
     wrap.classList.add('clickable');
@@ -507,6 +611,28 @@ function selectFromSource(path) {
   if (hit) showTrace(hit, {});
 }
 
+// Clicking a field in the compact tree: find the compaction decision whose
+// compactPath is this node or its nearest ancestor, and explain the choice.
+function selectFromCompact(path) {
+  const compact = state.compact;
+  if (!compact) return;
+  const np = normPath(path);
+  const decisions = (compact.compactDecisions || []).filter(d => d.compactPath);
+  const hit = decisions.find(d => normPath(d.compactPath) === np) ||
+    decisions
+      .filter(d => np.startsWith(normPath(d.compactPath) + '.') || np.startsWith(normPath(d.compactPath) + '[]'))
+      .sort((a, b) => b.compactPath.length - a.compactPath.length)[0];
+  if (!hit) {
+    // Structural nodes (@context itself, value-object internals such as
+    // @value/@language). For a @context key, explain the node scope and list
+    // the local includes with their pinned revisions.
+    const isContextKey = /(^|\.)@context$/.test(path);
+    showCompactContext(path, isContextKey ? (compact.scopeLayout || []) : []);
+    return;
+  }
+  showCompactDecision(hit, { compactPath: path });
+}
+
 function clearSelectionMarks() {
   $$('.node.selected').forEach(n => n.classList.remove('selected'));
   $$('.node.source-hit').forEach(n => n.classList.remove('source-hit'));
@@ -562,6 +688,106 @@ function describeTraceKind(t) {
   if (t.kind === 'dropped') return '该字段被展开算法丢弃';
   if (t.container?.length) return `属性展开（容器：${t.container.join(' + ')}）`;
   return '属性展开';
+}
+
+// ----------------------------------------------------- compact decisions ---
+const VIA_LABEL = {
+  term: '词项', prefix: '前缀 (CURIE)', vocab: '@vocab 后缀', iri: '完整 IRI',
+  alias: '关键字别名', keyword: '关键字', 'compact-iri': 'compact IRI'
+};
+const MODE_LABEL = {
+  plain: '普通形式', list: '@list 容器', languageMap: '@language 容器（语言映射）',
+  indexMap: '@index 容器（索引映射）', idMap: '@id 容器（ID 映射）',
+  typeMap: '@type 容器（类型映射）'
+};
+
+function showCompactDecision(dec, { compactPath }) {
+  clearSelectionMarks();
+  state.compactPathEls.get(compactPath)?.classList.add('selected');
+
+  const detail = $('#traceDetail');
+  const pinned = state.compact?.pinnedResources ?? {};
+  const refRevision = dec.sourceRef
+    ? pinned[dec.sourceRef.replace(/^local:/, '')]
+    : null;
+
+  const candidateRows = (dec.candidates || []).map(c => {
+    const rev = c.sourceRef ? pinned[c.sourceRef.replace(/^local:/, '')] : null;
+    const cls = c.accepted ? 'cand accepted' : (c.applicable === false ? 'cand rejected' : 'cand');
+    return `<div class="${cls}">
+      <span class="cand-key">${escapeHtml(c.key)}</span>
+      <span class="cand-via">${VIA_LABEL[c.via] ?? c.via}</span>
+      ${c.sourceRef ? `<span class="rev-pill-inline">${escapeHtml(c.sourceRef)}${rev ? '@' + shortRev(rev) : ''}</span>` : ''}
+      ${c.accepted ? '<span class="cand-mark ok">✓ 采用</span>' : ''}
+      ${c.applicable === false ? `<span class="cand-mark no">✗ ${escapeHtml(c.reason ?? '不适用')}</span>` : ''}
+    </div>`;
+  }).join('');
+
+  const valueRows = (dec.valueDecisions || []).filter(v => v.safe === false || v.shape).map(v =>
+    `<div class="vdec ${v.safe === false ? 'unsafe' : ''}">
+      <code>${escapeHtml(v.path ?? '')}</code> · ${escapeHtml(shapeLabel(v))}
+      ${v.safe === false ? `<div class="hint">保留显式形式：${escapeHtml(v.reason ?? '')}</div>` : ''}
+    </div>`).join('');
+
+  detail.innerHTML = `
+    <div class="trace-source compact-head">
+      <strong>压缩字段选择</strong>
+      <div><code>${escapeHtml(dec.compactPath)}</code></div>
+      <div class="hint" style="margin-top:4px">展开 IRI <span class="key iri">${escapeHtml(dec.expandedIri)}</span>
+        → 紧凑键 <strong>${escapeHtml(dec.compactKey)}</strong>（${VIA_LABEL[dec.via] ?? dec.via} · ${MODE_LABEL[dec.mode] ?? dec.mode}）</div>
+    </div>
+    <dl class="trace-kv">
+      <dt>展开路径</dt><dd><code>${escapeHtml(dec.path)}</code></dd>
+      ${dec.sourceRef ? `<dt>来源资源</dt><dd><code>${escapeHtml(dec.sourceRef)}</code>${refRevision ? ` · revision <code>${shortRev(refRevision)}</code>` : ''}</dd>` : ''}
+    </dl>
+    ${dec.term ? `<div class="hint">词项定义：ID <code>${escapeHtml(dec.term.id)}</code>${dec.term.container ? ' · 容器 ' + dec.term.container.join('+') : ''}${dec.term.typeMapping ? ' · @type ' + escapeHtml(dec.term.typeMapping) : ''}${dec.term.protected ? ' · 🛡 受保护' : ''}</div>` : ''}
+    <div>
+      <strong style="font-size:12px">候选与取舍（为何用此可读名称、为何不用其他）</strong>
+      <div class="cand-list" style="margin-top:6px">${candidateRows || '<p class="hint">无候选词项，使用完整 IRI。</p>'}</div>
+    </div>
+    ${valueRows ? `<div><strong style="font-size:12px">值的压缩决定</strong><div class="vdec-list" style="margin-top:6px">${valueRows}</div></div>` : ''}
+    ${dec.fallback ? `<div class="warning">该字段保留了可正确展开的显式形式（未强行缩短），再展开语义不变。</div>` : ''}
+    ${dec.note ? `<div class="hint">${escapeHtml(dec.note)}</div>` : ''}
+  `;
+  switchTab('trace');
+}
+
+function shapeLabel(v) {
+  const map = {
+    scalar: '标量', array: '数组', node: '节点对象', list: '@list',
+    'id-coercion': '@id 强制 → 标量 IRI', 'vocab-coercion': '@vocab 强制 → 词表值',
+    'typed-literal': '类型字面量（由词项 @type 还原）',
+    'language-literal': '语言字符串（由词项/默认语言还原）',
+    'plain-literal': '普通字面量 → 标量',
+    'value-object': '保留显式值对象',
+    'language-literal-blocked': '语言标记无法还原',
+    'plain-literal-blocked': '裸字符串会被加上语言标记',
+    'typed-literal-blocked': '裸标量会被加上数据类型',
+    'id-coercion-blocked': '@vocab 值无法压缩'
+  };
+  return map[v.shape] ?? v.shape;
+}
+
+function showCompactContext(path, scopes) {
+  const detail = $('#traceDetail');
+  const list = Array.isArray(scopes) ? scopes : (scopes ? [scopes] : []);
+  const includeBlocks = list.map((scope, si) => {
+    const includes = (scope.includes ?? []).map(i =>
+      `<div class="chain-step"><span class="step-icon include">↳</span><div class="step-body">
+        <div class="step-title">${escapeHtml(i.ref)}</div>
+        <div class="step-note">钉死 revision ${i.revision ? shortRev(i.revision) : '?'}</div></div></div>`).join('');
+    return `<div class="scope-block">
+      <div class="hint">节点 <code>${escapeHtml(scope.outPath ?? '?')}</code> 的 @context = ${escapeHtml(JSON.stringify(scope.raw))}</div>
+      ${includes ? `<div class="chain-list">${includes}</div>` : ''}
+    </div>`;
+  }).join('');
+  detail.innerHTML = `
+    <div class="trace-source compact-head"><strong>节点级 @context</strong>
+      <div><code>${escapeHtml(path)}</code></div></div>
+    <p class="hint">节点自己的 @context 在压缩时被放回原节点；其词项只在该节点及其子树有效，不会泄漏给兄弟节点。</p>
+    ${includeBlocks || '<p class="hint">该文档没有节点级 @context（使用文档级上下文）。</p>'}
+  `;
+  switchTab('trace');
 }
 
 function renderTermInfo(trace) {
@@ -681,6 +907,8 @@ function escapeHtml(s) {
       if (r) state.bindings.set(name, 'latest');
     }
     renderBindings();
+    renderResults(null);
+    renderCompact(null);
   } catch (err) {
     $('#docError').textContent = '初始化失败：' + err.message;
     $('#docError').classList.remove('hidden');

@@ -36,19 +36,26 @@ export function expandDocument(doc, opts) {
 
   const traces = [];
   const warnings = active.warnings;
+  // Every node that carries its own "@context" gets one entry here, in tree
+  // order. Entries include the raw context, the outPath of the node and the
+  // scoped decision chain — enough for compaction to place a local "@context"
+  // back at exactly the node it belongs to (node scope, never leaking to
+  // siblings). active:false means the node expanded to nothing and must be
+  // skipped when consuming the list.
+  const scopes = [];
 
   // Document-level @context
   let element = doc;
   if (doc && typeof doc === 'object' && !Array.isArray(doc) && '@context' in doc) {
     active = processContext(active, doc['@context'], {
-      loader, chain: decisionChain, maxDepth: maxContextDepth, baseUrl
+      loader, chain: decisionChain, maxDepth: maxContextDepth, baseUrl, sourceStack: []
     });
     element = { ...doc };
     delete element['@context'];
   }
 
   const expanded = expandElement(active, null, element, {
-    loader, traces, decisionChain, chainStack: [decisionChain],
+    loader, traces, decisionChain, scopes, chainStack: [decisionChain],
     maxDepth, maxContextDepth,
     depth: 0, sourcePath: '$', outPath: '$', warnings
   });
@@ -60,6 +67,10 @@ export function expandDocument(doc, opts) {
     traces,
     warnings,
     decisionChain,
+    scopes: scopes.filter(s => s.active),
+    rootContext: doc && typeof doc === 'object' && !Array.isArray(doc) && '@context' in doc
+      ? doc['@context']
+      : null,
     finalContext: serializeContext(active)
   };
 }
@@ -106,13 +117,26 @@ function expandElement(active, activeProperty, element, env) {
   // objects ---------------------------------------------------------------
   let ctx = active;
   let scopedChain = null;
+  let scopeRecord = null;
 
   // scoped context
   if ('@context' in element) {
     scopedChain = [];
+    // The active origin stack inside a node-local context is independent:
+    // process the raw value fresh; includes it pulls in carry their own
+    // "local:" origins.
     ctx = processContext(active, element['@context'], {
-      loader: env.loader, chain: scopedChain, maxDepth: env.maxContextDepth
+      loader: env.loader, chain: scopedChain, maxDepth: env.maxContextDepth,
+      sourceStack: []
     });
+    scopeRecord = {
+      active: false,
+      sourcePath: env.sourcePath,
+      outPath: env.outPath,
+      raw: element['@context'],
+      chain: scopedChain
+    };
+    env.scopes.push(scopeRecord);
   }
   // Chain visible to everything expanded inside this node: the document-level
   // chain plus every scoped chain on the path from the root to this node.
@@ -262,6 +286,7 @@ function expandElement(active, activeProperty, element, env) {
   if (Object.keys(node).length === 1 && ('@id' in node || '@index' in node) && activeProperty !== null) {
     // bare reference node — still valid, keep
   }
+  if (scopeRecord) scopeRecord.active = true;
   return node;
 }
 
@@ -381,11 +406,12 @@ function applyCoercion(item, coerce, ctx) {
   if (coerce === '@json') return item;
   // typed literal coercion
   if (typeof item === 'object' && item !== null && '@value' in item) {
-    if (!('@type' in item)) return { ...item, '@type': coerce };
+    if (!('@type' in item)) return { ...item, '@type': [coerce] };
+    if (typeof item['@type'] === 'string') return { ...item, '@type': [item['@type']] };
     return item;
   }
   if (typeof item !== 'object') {
-    return { '@value': item, '@type': coerce };
+    return { '@value': item, '@type': [coerce] };
   }
   return item;
 }
@@ -399,7 +425,7 @@ function expandValue(ctx, activeProperty, value, env) {
     return { '@id': expandIri(ctx, value, { vocab: true, documentRelative: true }) };
   }
   if (def?.typeMapping && def.typeMapping !== '@json') {
-    return { '@value': value, '@type': def.typeMapping };
+    return { '@value': value, '@type': [def.typeMapping] };
   }
   if (typeof value === 'string') {
     const lang = def?.language ?? ctx.language;

@@ -86,7 +86,7 @@ describe('@vocab, prefixes and keyword aliases', () => {
     );
     assert.deepEqual(
       expanded[0]['https://schema.org/dateCreated'],
-      [{ '@value': '2026-09-26', '@type': 'http://www.w3.org/2001/XMLSchema#date' }]
+      [{ '@value': '2026-09-26', '@type': ['http://www.w3.org/2001/XMLSchema#date'] }]
     );
   });
 
