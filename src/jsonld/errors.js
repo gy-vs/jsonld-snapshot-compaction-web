@@ -26,6 +26,7 @@ export const ERR = {
   PROCESSING_DEPTH_EXCEEDED: 'processing depth exceeded',
   UNKNOWN_RESOURCE: 'unknown resource',
   REVISION_CONFLICT: 'revision conflict',
+  COMPACTION_CONFLICT: 'compaction conflict',
   VALIDATION: 'validation error',
   NOT_FOUND: 'not found'
 };

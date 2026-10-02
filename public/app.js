@@ -1,4 +1,5 @@
 // JSON-LD workbench frontend — vanilla JS, no build step.
+import { deriveScopes, rootContextFrom, norm as normPath } from './scopes.js';
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
@@ -7,10 +8,12 @@ const state = {
   sessionId: null,
   bindings: new Map(),   // name -> revision id (only checked entries)
   result: null,
+  compact: null,
   editor: { name: null, baseRevision: null, selectedRevision: null, mode: 'edit' },
   pendingBody: null,
   sourcePathEls: new Map(),
-  expandedPathEls: new Map()
+  expandedPathEls: new Map(),
+  compactPathEls: new Map()
 };
 
 // ---------------------------------------------------------------- API -----
@@ -233,6 +236,7 @@ $('#sessionSelect').addEventListener('change', async e => {
   if (!id) {
     state.sessionId = null;
     $('#sessionInfo').textContent = '';
+    resetParseViews('已切换为一次性解析：请重新展开。');
     return;
   }
   const s = await api('GET', `/api/sessions/${id}`);
@@ -249,7 +253,20 @@ $('#sessionSelect').addEventListener('change', async e => {
       cb.checked = true; sel.disabled = false; sel.value = state.bindings.get(name);
     }
   });
+  resetParseViews('已切换会话：展开与压缩视图已清空，请依据该会话快照重新展开。');
 });
+
+function resetParseViews(message) {
+  state.result = null;
+  state.compact = null;
+  $('#compactBtn').disabled = true;
+  $('#compactBadge').className = 'compact-badge hidden';
+  $('#compactBadge').textContent = '';
+  $('#compactError').classList.add('hidden');
+  renderResults(null);
+  renderGlobalChain([]);
+  if (message) $('#warnings').innerHTML = `<div class="warning">${escapeHtml(message)}</div>`;
+}
 
 $('#newSessionBtn').addEventListener('click', async () => {
   const doc = readDoc(true);
@@ -309,6 +326,7 @@ function readDoc(silent = false) {
 }
 
 $('#parseBtn').addEventListener('click', doParse);
+$('#compactBtn').addEventListener('click', doCompact);
 
 async function doParse() {
   const document = readDoc();
@@ -320,16 +338,74 @@ async function doParse() {
       ? await api('POST', `/api/sessions/${state.sessionId}/parse`, { document, baseUrl })
       : await api('POST', '/api/parse', { document, bindings, baseUrl });
     state.result = result;
+    state.compact = null;
     renderResults(result);
+    $('#compactBtn').disabled = false;
+    showCompactTarget(result, bindings);
     switchTab('trees');
   } catch (err) {
     $('#docError').textContent = `${err.code}\n${err.message}` +
       (err.details ? `\n\n${JSON.stringify(err.details, null, 2)}` : '');
     $('#docError').classList.remove('hidden');
-    // still show partial diagnostic chain when available
-    state.result = null;
-    renderResults(null);
+    // Preserve the previous input/expanded/compact views: a new parse error
+    // must not blank out what was already on screen.
     switchTab('input');
+  }
+}
+
+function showCompactTarget(result, bindings) {
+  const box = $('#compactTarget');
+  const txt = $('#compactTargetText');
+  if (state.sessionId) {
+    box.classList.remove('hidden');
+    const pinned = Object.entries(result.pinnedResources ?? {})
+      .map(([n, r]) => `local:${n}@${shortRev(r)}`).join(', ');
+    txt.textContent = `压缩目标上下文 = 会话快照（${pinned || '无绑定'}）；压缩结果依据这些钉死的 revision。`;
+  } else {
+    box.classList.remove('hidden');
+    const pinned = Object.entries(bindings).map(([n, r]) => `local:${n}@${shortRev(r)}`).join(', ');
+    txt.textContent = `压缩目标上下文 = 当前一次性解析绑定（${pinned || '无绑定'}）。`;
+  }
+}
+
+async function doCompact() {
+  const document = readDoc(true);
+  const result = state.result;
+  if (!result) return;
+  const badge = $('#compactBadge');
+  badge.className = 'compact-badge busy';
+  badge.textContent = '压缩中…';
+  $('#compactError').classList.add('hidden');
+  try {
+    const rootContext = rootContextFrom(document, result.decisionChain);
+    const scopes = deriveScopes(result.expanded, result.traces, result.decisionChain);
+    const baseUrl = $('#baseUrlInput').value.trim() || null;
+    const payload = {
+      expanded: result.expanded,
+      rootContext,
+      scopes: Object.fromEntries(scopes),
+      baseUrl
+    };
+    const out = state.sessionId
+      ? await api('POST', `/api/sessions/${state.sessionId}/compact`, payload)
+      : await api('POST', '/api/compact', { ...payload, bindings: Object.fromEntries(state.bindings) });
+    state.compact = out;
+    renderCompact(out);
+    badge.className = 'compact-badge ok';
+    badge.textContent = `已验证：再展开语义一致 · 依据 ${Object.keys(out.pinnedResources ?? {}).length} 个钉死 revision`;
+  } catch (err) {
+    state.compact = null;
+    renderCompact(null);
+    badge.className = 'compact-badge hidden';
+    badge.textContent = '';
+    // Keep the original input and expanded tree; classify the failure so the
+    // user can tell a resource/context problem apart from an inexpressible
+    // value rather than seeing an empty tree.
+    const el = $('#compactError');
+    const kind = err.details?.kind ? `（类型：${err.details.kind}）` : '';
+    el.textContent = `压缩未能安全完成：${err.code}${kind}\n${err.message}` +
+      (err.details?.candidates ? `\n\n候选字段诊断：\n${JSON.stringify(err.details.candidates, null, 2)}` : '');
+    el.classList.remove('hidden');
   }
 }
 
@@ -349,6 +425,7 @@ function renderResults(result) {
     $('#traceDetail').innerHTML = '<p class="placeholder">解析失败，无追踪信息。</p>';
     $('#globalChain').innerHTML = '';
     $('#warnings').innerHTML = '';
+    renderCompact(null);
     return;
   }
 
@@ -363,7 +440,21 @@ function renderResults(result) {
   $('#warnings').innerHTML = (result.warnings || [])
     .map(w => `<div class="warning">⚠ ${escapeHtml(w.message)}</div>`).join('');
   renderGlobalChain(result.decisionChain);
-  $('#traceDetail').innerHTML = '<p class="placeholder">在「展开结果」中点击任意字段。</p>';
+  $('#traceDetail').innerHTML = '<p class="placeholder">在「展开结果」或「紧凑结果」中点击任意字段。</p>';
+  renderCompact(state.compact);
+}
+
+function renderCompact(out) {
+  state.compactPathEls = new Map();
+  const root = $('#compactTree');
+  root.innerHTML = '';
+  const badge = $('#compactBadge');
+  if (!out) {
+    root.innerHTML = '<p class="placeholder">尚未压缩。<br/>展开后点击「压缩 (Compact)」，依据当前资源绑定/会话快照生成。</p>';
+    if (badge) { badge.className = 'compact-badge hidden'; badge.textContent = ''; }
+    return;
+  }
+  root.appendChild(buildTree(out.compact, '$', 'compact'));
 }
 
 // -------------------------------------------------------------- tree UI ---
@@ -427,6 +518,13 @@ function renderNode(value, path, key, kind, isRoot = false) {
     state.sourcePathEls.set(path, wrap);
     wrap.classList.add('clickable');
     wrap.addEventListener('click', () => selectFromSource(path));
+  } else if (kind === 'compact') {
+    state.compactPathEls.set(path, wrap);
+    wrap.classList.add('clickable');
+    wrap.addEventListener('click', (e) => {
+      e.stopPropagation();
+      selectFromCompact(path);
+    });
   } else {
     state.expandedPathEls.set(path, wrap);
     wrap.classList.add('clickable');
@@ -473,12 +571,18 @@ function tag(cls, text) {
 }
 
 // ----------------------------------------------------------- selection ----
-function normPath(p) { return p.replace(/\[\d+\]/g, '[]'); }
+// Expanded/compact trees render the document ARRAY, so element paths carry a
+// leading "$[i]". Traces and compaction decisions address the logical node
+// root as "$" and normalize every other index to "[]". Map a UI path to that
+// logical shape for matching.
+function logicalShape(uiPath) {
+  return normPath(uiPath).replace(/^\$\[\]/, '$');
+}
 
 function selectFromExpanded(path) {
   const result = state.result;
   if (!result) return;
-  const np = normPath(path);
+  const np = logicalShape(path);
   const candidates = result.traces
     .filter(t => t.outPath)
     .map(t => ({ t, tp: normPath(t.outPath) }))
@@ -491,6 +595,115 @@ function selectFromExpanded(path) {
   candidates.sort((a, b) =>
     (b.tp.length - a.tp.length) || (b.t.outPath.length - a.outPath.length));
   showTrace(candidates[0].t, { expandedPath: path });
+}
+
+// Locate the compaction decision whose expanded shape owns an expanded path.
+function decisionForExpandedPath(path) {
+  const out = state.compact;
+  if (!out?.decisions) return null;
+  const np = logicalShape(path);
+  // exact shape match (property / keyword / node-id / node-type)
+  let hit = out.decisions.find(d => normPath(d.expandedShape) === np) || null;
+  if (hit) return hit;
+  // ancestor: a click on an inner node/value belongs to the nearest enclosing
+  // property decision
+  const cands = out.decisions
+    .filter(d => np.startsWith(normPath(d.expandedShape)))
+    .sort((a, b) => b.expandedShape.length - a.expandedShape.length);
+  return cands[0] ?? null;
+}
+
+// Map a logical decision shape (e.g. "$.a[]" or "$.a[].@id") back to the
+// expanded tree UI element path ("$[0].a[0]"), which clickable nodes were
+// registered with. @id/@type shapes point at the owning node.
+function expandedUiPathForShape(shape) {
+  let logical = normPath(shape);
+  logical = logical.replace(/\.(?:@id|@type)$/, '');
+  const els = [...state.expandedPathEls.keys()];
+  const target = logical.replace(/\[\]$/, '');
+  let best = null;
+  for (const p of els) {
+    if (logicalShape(p).replace(/\[\]$/, '') === target) { best = p; break; }
+  }
+  if (best) return best;
+  // fall back to the longest logical prefix match
+  let b2 = null;
+  for (const p of els) {
+    const lp = logicalShape(p);
+    if ((logical === lp || logical.startsWith(lp + '.') || logical.startsWith(lp + '[]')) &&
+      (!b2 || lp.length > logicalShape(b2).length)) b2 = p;
+  }
+  return b2;
+}
+
+// Map a logical compact shape back to the compact tree UI element path.
+function compactUiPathForShape(shape) {
+  const logical = normPath(shape);
+  const target = logical.replace(/\[\]$/, '');
+  for (const p of state.compactPathEls.keys()) {
+    if (logicalShape(p).replace(/\[\]$/, '') === target) return p;
+  }
+  let best = null;
+  for (const p of state.compactPathEls.keys()) {
+    const lp = logicalShape(p);
+    if ((logical === lp || logical.startsWith(lp + '.') || logical.startsWith(lp + '[]')) &&
+      (!best || lp.length > logicalShape(best).length)) best = p;
+  }
+  return best;
+}
+
+// Locate a compaction decision from a compact-tree path (compactShape match
+// or nearest enclosing compact node).
+function decisionForCompactPath(path) {
+  const out = state.compact;
+  if (!out?.decisions) return null;
+  const np = logicalShape(path);
+  let hit = out.decisions.find(d => d.compactShape && normPath(d.compactShape) === np);
+  if (hit) return hit;
+  hit = out.decisions.find(d => d.kind === 'scoped-context' && normPath(d.compactShape) === np);
+  if (hit) return hit;
+  return out.decisions
+    .filter(d => d.compactShape && (np.startsWith(normPath(d.compactShape)) ||
+      normPath(d.compactShape).startsWith(np)))
+    .sort((a, b) =>
+      Math.abs(normPath(a.compactShape).length - np.length) -
+      Math.abs(normPath(b.compactShape).length - np.length))[0] ?? null;
+}
+
+function selectFromCompact(path) {
+  const out = state.compact;
+  if (!out) return;
+  const d = decisionForCompactPath(path);
+  if (!d) {
+    $('#traceDetail').innerHTML =
+      `<p class="placeholder">该紧凑节点（<code>${escapeHtml(path)}</code>）没有对应的压缩字段决定，它可能是值对象或容器内部结构。请点击其上层字段。</p>`;
+    switchTab('trace');
+    return;
+  }
+  markCompactDecision(d, { compactPath: path });
+}
+
+function markCompactDecision(d, { compactPath } = {}) {
+  clearSelectionMarks();
+  if (compactPath) state.compactPathEls.get(compactPath)?.classList.add('compact-selected');
+  // Highlight the matching expanded node + source field when available.
+  if (d.expandedShape) {
+    const el = state.expandedPathEls.get(expandedUiPathForShape(d.expandedShape));
+    el?.classList.add('selected');
+  }
+  const trace = state.result?.traces?.find(t => {
+    if (d.kind === 'node-id') return t.kind === 'node-id' && normPath(t.outPath) === normPath(d.expandedShape);
+    if (d.kind === 'node-type') return t.kind === 'node-type' && normPath(t.outPath) === normPath(d.expandedShape);
+    if (d.kind === 'property' || d.kind === 'keyword-property')
+      return t.kind === 'property' && normPath(t.outPath).startsWith(normPath(d.expandedShape));
+    return false;
+  });
+  if (trace) {
+    const srcEl = state.sourcePathEls.get(trace.sourcePath);
+    srcEl?.classList.add('source-hit');
+  }
+  renderCompactDecision(d, trace);
+  switchTab('trace');
 }
 
 function selectFromSource(path) {
@@ -510,6 +723,7 @@ function selectFromSource(path) {
 function clearSelectionMarks() {
   $$('.node.selected').forEach(n => n.classList.remove('selected'));
   $$('.node.source-hit').forEach(n => n.classList.remove('source-hit'));
+  $$('.node.compact-selected').forEach(n => n.classList.remove('compact-selected'));
 }
 
 function showNoTrace(path) {
@@ -528,6 +742,11 @@ function showTrace(trace, { expandedPath }) {
   const finalCtx = state.result.finalContext;
   const detail = $('#traceDetail');
   const termInfo = renderTermInfo(trace);
+  const compactDecision = state.compact ? decisionForExpandedPath(expandedPath ?? trace.outPath ?? '') : null;
+  if (compactDecision?.compactShape) {
+    const cp = compactUiPathForShape(compactDecision.compactShape);
+    if (cp) state.compactPathEls.get(cp)?.classList.add('compact-selected');
+  }
   detail.innerHTML = `
     <div class="trace-source">
       <strong>原始字段</strong>
@@ -542,6 +761,7 @@ function showTrace(trace, { expandedPath }) {
       ${trace.kind === 'node-id' ? `<dt>@id 解析</dt><dd><code>${escapeHtml(trace.value)}</code> → ${escapeHtml(trace.resolved)}</dd>` : ''}
     </dl>
     ${termInfo}
+    ${compactDecision ? renderCompactDecisionHtml(compactDecision) : (state.compact ? '<p class="hint">该展开节点没有对应的紧凑字段决定。</p>' : '')}
     ${trace.reason ? `<div class="warning">丢弃原因：${escapeHtml(trace.reason)}</div>` : ''}
     <div>
       <strong style="font-size:12px">该字段可见的完整 context 决策链（${trace.decisionChain?.length ?? 0} 步）</strong>
@@ -590,6 +810,115 @@ function renderTermInfo(trace) {
     body = '键本身是绝对 IRI，原样使用';
   }
   return body ? `<div class="trace-kv" style="grid-template-columns:82px 1fr"><dt>解析方式</dt><dd>${body}</dd></div>` : '';
+}
+
+function renderCompactDecision(d, trace) {
+  clearExtraCompactHighlight(d);
+  const detail = $('#traceDetail');
+  let html = '';
+  if (trace) {
+    html = `
+      <div class="trace-source">
+        <strong>原始字段</strong>
+        <div><code>${escapeHtml(trace.sourcePath)}</code></div>
+        <div class="hint" style="margin-top:4px">${escapeHtml(describeTraceKind(trace))}</div>
+      </div>
+      <dl class="trace-kv">
+        <dt>展开为</dt><dd><span class="key iri">${escapeHtml(d.expandedIri ?? '')}</span></dd>
+      </dl>
+      ${renderTermInfo(trace)}`;
+  }
+  detail.innerHTML = html + renderCompactDecisionHtml(d);
+  switchTab('trace');
+}
+
+function clearExtraCompactHighlight(d) {
+  // keep compact + expanded marks; just ensure source highlight if trace absent
+}
+
+const VIA_LABEL = {
+  term: '词项', 'keyword-alias': '关键字别名', prefix: 'compact IRI 前缀',
+  '@vocab': '@vocab 后缀', 'absolute-iri': '绝对 IRI',
+  relative: '@base 相对引用', 'root-relative': '根相对引用',
+  keyword: '关键字原样', 'blank-node': '空白节点'
+};
+
+function renderCompactDecisionHtml(d) {
+  const pinned = state.compact?.pinnedResources ?? {};
+  const revLine = (res) => {
+    if (!res) return '';
+    if (res.inline) return `<span class="hint">来源：文档内联 context（非资源 revision）</span>`;
+    const rev = res.ref ? pinned[res.ref.slice('local:'.length)] : null;
+    return `<span class="rev-mini">${escapeHtml(res.ref ?? '')}${rev ? '@' + shortRev(rev) : ''}</span>`;
+  };
+
+  if (d.kind === 'scoped-context') {
+    return `<div class="decision-block">
+      <div class="d-title">节点级 @context（局部作用域）</div>
+      <div class="hint">${escapeHtml(d.reason)}</div>
+      <div style="margin-top:4px">${(d.scope ?? []).map(r =>
+        `<span class="rev-mini">${escapeHtml(r)}@${shortRev(pinned[r.slice('local:'.length)] ?? '?')}</span>`).join(' ')}</div>
+      <div class="hint" style="margin-top:4px">展开形状 <code>${escapeHtml(d.expandedShape)}</code> → 紧凑形状 <code>${escapeHtml(d.compactShape)}</code></div>
+    </div>`;
+  }
+
+  const key = d.compactKey ?? '';
+  const members = d.members ? `
+    <div style="margin-top:6px"><strong style="font-size:11.5px">类型成员：</strong></div>
+    <div class="cand-list">${d.members.map(m => `
+      <div class="cand ${m.selected ? 'chosen' : ''}">
+        <div class="cand-head"><span class="cand-key">${escapeHtml(m.value)}</span>
+          <span class="cand-via">${escapeHtml(VIA_LABEL[m.via] ?? m.via)}</span></div>
+        <div class="cand-reason">${escapeHtml(m.reason ?? '')} · 目标 IRI <code>${escapeHtml(m.iri)}</code></div>
+      </div>`).join('')}</div>` : '';
+
+  const candidates = d.candidates ? `
+    <div style="margin-top:6px"><strong style="font-size:11.5px">候选名称（已逐一再展开验证）：</strong></div>
+    <div class="cand-list">${d.candidates.map(c => {
+      const usable = c.usable === true;
+      const cls = c.selected ? 'chosen' : (c.usable === false ? 'rejected' : '');
+      return `<div class="cand ${cls}">
+        <div class="cand-head">
+          <span class="cand-key">${escapeHtml(c.key)}</span>
+          <span class="cand-via">${escapeHtml(VIA_LABEL[c.via] ?? c.via)}</span>
+          ${c.selected ? '<span class="meta-tag" style="color:var(--green);border-color:rgba(83,194,135,.5)">采用</span>' : ''}
+          ${c.usable === false ? '<span class="meta-tag" style="color:var(--danger);border-color:rgba(224,108,108,.5)">弃用</span>' : ''}
+          ${revLine(c.resource ?? d.resource)}
+        </div>
+        <div class="cand-reason">${escapeHtml(c.reason ?? '')}</div>
+      </div>`;
+    }).join('')}</div>` : '';
+
+  const idVia = d.idVia ? `<dt>@id 形式</dt><dd>${escapeHtml(VIA_LABEL[d.idVia] ?? d.idVia)}</dd>` : '';
+  const form = d.form ? `<span class="form-pill">${escapeHtml(formLabel(d.form))}</span>` : '';
+
+  return `<div class="decision-block">
+    <div class="d-title">压缩字段决定 ${form}</div>
+    <dl class="trace-kv" style="grid-template-columns:78px 1fr;margin-top:4px">
+      <dt>展开 IRI</dt><dd><span class="key iri">${escapeHtml(d.expandedIri ?? '')}</span></dd>
+      <dt>紧凑键</dt><dd><span class="key">${escapeHtml(key)}</span> ${revLine(d.resource)}</dd>
+      ${idVia}
+      <dt>形状</dt><dd class="hint"><code>${escapeHtml(d.expandedShape ?? '')}</code> → <code>${escapeHtml(d.compactShape ?? '')}</code></dd>
+    </dl>
+    <div class="hint" style="margin-top:4px">${escapeHtml(d.reason ?? '')}</div>
+    ${(d.notes ?? []).length ? `<div class="warning" style="margin-top:4px">${d.notes.map(escapeHtml).join('<br/>')}</div>` : ''}
+    ${members}
+    ${candidates}
+  </div>`;
+}
+
+function formLabel(form) {
+  return {
+    'plain': '普通值',
+    'list-container': '@list 容器 → 数组',
+    'language-map': '@language 映射',
+    'index-map': '@index 映射',
+    'id-map': '@id 映射',
+    'type-map': '@type 映射',
+    'explicit': '显式形式（无法安全缩短）',
+    'explicit-list': '显式 @list',
+    'explicit-value-object': '显式值对象'
+  }[form] ?? form;
 }
 
 // ------------------------------------------------------------- chain UI ----

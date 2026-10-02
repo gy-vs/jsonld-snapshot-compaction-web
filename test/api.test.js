@@ -197,3 +197,160 @@ describe('session API', () => {
     assert.equal(res.status, 404);
   });
 });
+
+describe('compaction lifecycle (save → session → expand → compact → re-expand → resource edit)', () => {
+  test('full path round-trips and stays pinned to the session revision', async () => {
+    // 1. Save a resource (v1).
+    const created = await api('PUT', '/api/resources/vocab', {
+      body: {
+        '@base': 'https://example.com/things/',
+        '@vocab': 'https://schema.org/',
+        'xsd': { '@id': 'http://www.w3.org/2001/XMLSchema#', '@prefix': true },
+        'created': { '@id': 'dateCreated', '@type': 'xsd:date' },
+        'id': '@id', 'kind': '@type'
+      },
+      baseRevision: null
+    });
+    assert.equal(created.status, 200);
+    const rev1 = created.json.revision;
+
+    // 2. Create a session pinned at v1.
+    const ses = await api('POST', '/api/sessions', {
+      name: 'lifecycle',
+      bindings: { vocab: rev1 },
+      document: {
+        '@context': 'local:vocab', 'id': 'w/7', 'kind': 'Product',
+        'created': '2026-09-26'
+      }
+    });
+    assert.equal(ses.status, 201);
+    const sid = ses.json.id;
+
+    // 3. Expand within the session.
+    const parsed = await api('POST', `/api/sessions/${sid}/parse`, {});
+    assert.equal(parsed.status, 200);
+    const node = parsed.json.expanded[0];
+    assert.equal(node['@id'], 'https://example.com/things/w/7');
+    assert.deepEqual(node['@type'], ['https://schema.org/Product']);
+    assert.equal(
+      node['https://schema.org/dateCreated'][0]['@type'],
+      'http://www.w3.org/2001/XMLSchema#date'
+    );
+
+    // 4. Compact the expanded result against the SAME session snapshot.
+    const compacted = await api('POST', `/api/sessions/${sid}/compact`, {
+      expanded: parsed.json.expanded,
+      rootContext: ['local:vocab']
+    });
+    assert.equal(compacted.status, 200);
+    const c = compacted.json.compact;
+    assert.deepEqual(c['@context'], 'local:vocab');
+    assert.equal(c.id, 'w/7');               // keyword alias + relative @id
+    assert.equal(c.kind, 'Product');         // keyword alias + @vocab type
+    assert.equal(c.created, '2026-09-26');   // datatype coercion elides @type
+    assert.equal(compacted.json.pinnedResources.vocab, rev1);
+    // every property decision is marked safe and attributed to a revision
+    assert.ok(compacted.json.decisions.length >= 3);
+    for (const d of compacted.json.decisions) assert.equal(d.safe, true);
+
+    // 5. Re-expand the compact document (ad-hoc parse bound to the same rev):
+    //    must be semantically identical to the original expanded result.
+    const reparsed = await api('POST', '/api/parse', {
+      document: c,
+      bindings: { vocab: rev1 }
+    });
+    assert.equal(reparsed.status, 200);
+    assert.deepEqual(reparsed.json.expanded, parsed.json.expanded);
+
+    // 6. Save a NEW revision of the resource that changes the vocabulary.
+    const updated = await api('PUT', '/api/resources/vocab', {
+      body: { '@vocab': 'https://CHANGED.example/', 'id': '@id' },
+      baseRevision: rev1
+    });
+    assert.equal(updated.status, 200);
+    const rev2 = updated.json.revision;
+    assert.notEqual(rev1, rev2);
+
+    // 7. Re-expand AND re-compact the OLD session: still interpreted with rev1.
+    const parsedAgain = await api('POST', `/api/sessions/${sid}/parse`, {});
+    assert.equal(parsedAgain.json.pinnedResources.vocab, rev1);
+    const compactAgain = await api('POST', `/api/sessions/${sid}/compact`, {
+      expanded: parsedAgain.json.expanded,
+      rootContext: ['local:vocab']
+    });
+    assert.equal(compactAgain.status, 200);
+    assert.equal(compactAgain.json.pinnedResources.vocab, rev1);
+    assert.equal(compactAgain.json.compact.kind, 'Product'); // old rev has kind:@type
+    assert.deepEqual(compactAgain.json.compact, c);
+
+    // 8. A NEW session reads the new head and compacts with the new mapping.
+    const ses2 = await api('POST', '/api/sessions', {
+      bindings: { vocab: 'latest' },
+      document: { '@context': 'local:vocab', 'id': 'w/7', 'Product': 1 }
+    });
+    assert.equal(ses2.json.resources.vocab, rev2);
+    const parsed2 = await api('POST', `/api/sessions/${ses2.json.id}/parse`, {});
+    const compact2 = await api('POST', `/api/sessions/${ses2.json.id}/compact`, {
+      expanded: parsed2.json.expanded,
+      rootContext: ['local:vocab']
+    });
+    assert.equal(compact2.status, 200);
+    assert.equal(compact2.json.pinnedResources.vocab, rev2);
+    // under the new vocab the property expands under the changed namespace
+    assert.ok(parsed2.json.expanded[0]['https://CHANGED.example/Product']);
+  });
+
+  test('ad-hoc compact mirrors ad-hoc parse binding semantics', async () => {
+    await api('PUT', '/api/resources/adhoc', {
+      body: { '@vocab': 'https://v1/' }, baseRevision: null
+    });
+    const expand = await api('POST', '/api/parse', {
+      document: { '@context': 'local:adhoc', 'field': 'x' },
+      bindings: { adhoc: 'latest' }
+    });
+    const compact = await api('POST', '/api/compact', {
+      expanded: expand.json.expanded,
+      rootContext: ['local:adhoc'],
+      bindings: { adhoc: 'latest' }
+    });
+    assert.equal(compact.status, 200);
+    assert.equal(compact.json.compact.field, 'x');
+    // re-expansion through the same ad-hoc binding is identical
+    const again = await api('POST', '/api/parse', {
+      document: compact.json.compact,
+      bindings: { adhoc: 'latest' }
+    });
+    assert.deepEqual(again.json.expanded, expand.json.expanded);
+  });
+
+  test('compact against an unbound local ref is rejected (no remote fetch)', async () => {
+    const res = await api('POST', '/api/compact', {
+      expanded: [{ '@id': 'x' }],
+      rootContext: ['local:not-bound'],
+      bindings: {}
+    });
+    assert.equal(res.status, 404);
+    assert.equal(res.json.error.code, 'unknown resource');
+    assert.equal(res.json.error.details.ref, 'local:not-bound');
+  });
+
+  test('an inexpressible value returns a classified conflict and keeps inputs available', async () => {
+    await api('PUT', '/api/resources/coerce', {
+      body: {
+        '@vocab': 'https://v/',
+        'n': { '@id': 'n', '@type': 'http://www.w3.org/2001/XMLSchema#integer' }
+      },
+      baseRevision: null
+    });
+    const res = await api('POST', '/api/compact', {
+      expanded: [{ 'https://v/n': [{
+        '@value': '5', '@type': 'http://www.w3.org/2001/XMLSchema#string'
+      }] }],
+      rootContext: ['local:coerce'],
+      bindings: { coerce: 'latest' }
+    });
+    assert.equal(res.status, 422);
+    assert.equal(res.json.error.code, 'compaction conflict');
+    assert.equal(res.json.error.details.kind, 'inexpressible-value');
+  });
+});

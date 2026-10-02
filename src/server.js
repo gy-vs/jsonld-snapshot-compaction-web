@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize, extname } from 'node:path';
 import { Store } from './store.js';
 import { runParse } from './parse-service.js';
+import { runCompact } from './compact-service.js';
 import { JsonLdError } from './jsonld/errors.js';
 import { seedIfEmpty } from './seed.js';
 
@@ -117,6 +118,43 @@ async function route(req, res, store) {
     return sendJson(res, 200, { ...output, pinnedResources: pinned });
   }
 
+  // session-bound compaction: target context is the session's pinned snapshot
+  if (path.startsWith('/api/sessions/') && path.endsWith('/compact')) {
+    const id = decodeURIComponent(path.split('/')[3]);
+    if (method === 'POST') {
+      const session = store.data.sessions[id];
+      if (!session) throw new JsonLdError('not found', `Session "${id}" does not exist`);
+      const input = await readJson(req);
+      const output = runCompact({
+        expanded: requireExpanded(input),
+        snapshotMap: store.snapshotFor(session),
+        rootRefs: Array.isArray(input?.rootContext) ? input.rootContext
+          : (typeof input?.rootContext === 'string' ? [input.rootContext] : sessionRootRefs(session)),
+        scopes: input?.scopes ?? {},
+        baseUrl: input?.baseUrl ?? null,
+        maxContextDepth: input?.maxContextDepth ?? 32
+      });
+      return sendJson(res, 200, { sessionId: id, ...output });
+    }
+  }
+
+  // ad-hoc compaction against explicitly bound resource revisions
+  if (path === '/api/compact' && method === 'POST') {
+    const input = await readJson(req);
+    const expanded = requireExpanded(input);
+    const { map, pinned } = store.resolveAdHocSnapshot(input?.bindings ?? {});
+    const output = runCompact({
+      expanded,
+      snapshotMap: map,
+      rootRefs: Array.isArray(input?.rootContext) ? input.rootContext
+        : (typeof input?.rootContext === 'string' ? [input.rootContext] : []),
+      scopes: input?.scopes ?? {},
+      baseUrl: input?.baseUrl ?? null,
+      maxContextDepth: input?.maxContextDepth ?? 32
+    });
+    return sendJson(res, 200, { ...output, pinnedResources: pinned });
+  }
+
   // static frontend
   if (method === 'GET') {
     const rel = path === '/' ? 'index.html' : path.slice(1);
@@ -136,6 +174,20 @@ async function route(req, res, store) {
   }
 
   sendJson(res, 404, { error: { code: 'not found', message: `${method} ${path}` } });
+}
+
+function requireExpanded(input) {
+  if (!input || !Array.isArray(input.expanded)) {
+    throw new JsonLdError('validation error',
+      'Compact requests expect { expanded }: the expanded result (array) of a parse');
+  }
+  return input.expanded;
+}
+
+function sessionRootRefs(session) {
+  // Default root @context order for a session compact call: the pinned
+  // resource names, sorted, so the result is reproducible for the session.
+  return Object.keys(session.resources).sort().map(name => `local:${name}`);
 }
 
 function readJson(req) {
@@ -175,7 +227,8 @@ function sendError(res, err) {
     'invalid type mapping': 400,
     'invalid language mapping': 400,
     'invalid context entry': 400,
-    'invalid remote context': 400
+    'invalid remote context': 400,
+    'compaction conflict': 422
   }[err.code] ?? (err instanceof JsonLdError ? 422 : 500);
   sendJson(res, status, {
     error: {
